@@ -4,20 +4,31 @@
 #include <algorithm>
 
 AudioProcessor::AudioProcessor(QObject* parent) : QObject(parent) {}
+
 AudioProcessor::~AudioProcessor() {
-  if (_cfg) { kiss_fftr_free(_cfg); _cfg = nullptr; }
+  cleanup();
 }
 
 void AudioProcessor::start() {
   _stop.store(false);
-  _cfg = nullptr; // force re-init with current _sr
+  _initialized = false; // Force re-initialization
+  cleanup(); // Clean up any existing resources
   _fifoL.clear();
   _fifoR.clear();
 }
+
 void AudioProcessor::requestStop() {
   _stop.store(true);
-  if (_cfg) { kiss_fftr_free(_cfg); _cfg = nullptr; }
-  _fifoL.clear(); _fifoR.clear();
+  cleanup();
+  _fifoL.clear(); 
+  _fifoR.clear();
+}
+
+void AudioProcessor::cleanup() {
+  if (_cfg) { 
+    kiss_fftr_free(_cfg); 
+    _cfg = nullptr; 
+  }
 }
 
 // Receive LEFT/RIGHT samples from capture and append to their FIFOs.
@@ -55,12 +66,15 @@ void AudioProcessor::onFrames(const QVector<float>& left,
   processAvailableStereo();
 }
 
-void AudioProcessor::ensureInit() {
-  if (_cfg) return;
+void AudioProcessor::initialize() {
+  if (_initialized) return;
 
   // Allocate FFT plan
   _cfg = kiss_fftr_alloc(_N, 0, nullptr, nullptr);
-  if (!_cfg) { qWarning("kiss_fftr_alloc failed"); return; }
+  if (!_cfg) { 
+    qWarning("kiss_fftr_alloc failed"); 
+    return; 
+  }
 
   // Buffers sized to FFT
   _window.assign(_N, 0.0f);
@@ -71,10 +85,11 @@ void AudioProcessor::ensureInit() {
   _specR.assign(_N/2 + 1, kiss_fft_cpx{0,0});
   _magR.assign(_N/2 + 1, 0.0f);
 
+  // Setup all components
   computeWindow();
-  //computeBinLayout();
-  ensureLayout32();
+  setupFrequencyBands();
 
+  _initialized = true;
 }
 
 void AudioProcessor::computeWindow() {
@@ -84,59 +99,12 @@ void AudioProcessor::computeWindow() {
   }
 }
 
-void AudioProcessor::processAvailableStereo() {
-  ensureInit();
-  if (!_cfg) return;  // if plan allocation failed, bail safely
-
-  // Consume while both channels have at least N samples.
-  while (!_stop.load() &&
-         _fifoL.size() >= (int)_N &&
-         _fifoR.size() >= (int)_N)
-  {
-    processOneFrameStereo();  // copies N from each FIFO, windows, FFTs L/R, bands, etc.
-
-      // --- 32 (L/R) -> 16 mono control bins (simple & fast) ---
-  QVector<float> bins16(16, 0.0f);
-
-  if (_bands32L.size() == 32 && _bands32R.size() == 32) {
-    // Pair adjacent 32-bins, average L/R then average the pair.
-    for (int i = 0; i < 16; ++i) {
-      const int k0 = 2*i;
-      const int k1 = k0 + 1;
-
-      float lPair = 0.5f * (_bands32L[k0] + _bands32L[k1]);
-      float rPair = 0.5f * (_bands32R[k0] + _bands32R[k1]);
-      float mono  = 0.5f * (lPair + rPair);   // simple LR average
-
-      bins16[i] = mono;  // raw linear magnitude for now
-    }
-
-    // Per-frame normalize to 0..1 so UDP sender can map to 0..255 cleanly.
-    float mx = 0.0f;
-    for (float v : bins16) if (v > mx) mx = v;
-    if (mx > 0.0f) {
-      const float inv = 1.0f / mx;
-      for (float &v : bins16) v = std::clamp(v * inv, 0.0f, 1.0f);
-    }
-  } else {
-    // If 32s aren't ready for some reason, emit zeros (valid shape).
-    // bins16 already zero-initialized.
-  }
-
-  emit binsReady(bins16);
-
-    // Slide both FIFOs forward by hop in lock-step.
-    _fifoL.erase(_fifoL.begin(), _fifoL.begin() + _hop);
-    _fifoR.erase(_fifoR.begin(), _fifoR.begin() + _hop);
-  }
-}
-
-
-void AudioProcessor::ensureLayout32() {
-  if (_kLo32.size() == 32 && _kHi32.size() == 32) return;
-
-  _kLo32.resize(32);
-  _kHi32.resize(32);
+void AudioProcessor::setupFrequencyBands() {
+  const int numBands = 32;
+  _kLo32.resize(numBands);
+  _kHi32.resize(numBands);
+  _bands32L.resize(numBands);
+  _bands32R.resize(numBands);
 
   const float fNyq = 0.5f * _sr;
   const float fMin = 20.0f;
@@ -165,17 +133,58 @@ void AudioProcessor::ensureLayout32() {
     _kLo32[i] = k0;
     _kHi32[i] = k1;
   }
-
-  _bands32L.resize(32);
-  _bands32R.resize(32);
 }
 
+void AudioProcessor::processAvailableStereo() {
+  initialize();
+  if (!_initialized || !_cfg) return;  // if initialization failed, bail safely
+
+  // Consume while both channels have at least N samples.
+  while (!_stop.load() && (int)_fifoL.size() >= _N && (int)_fifoR.size() >= _N){
+    processOneFrameStereo();  // copies N from each FIFO, windows, FFTs L/R, bands, etc.
+
+    // --- TEMPORARY: 32 (L/R) -> 16 mono control bins (simple & fast) ---
+    // TODO: This is a temporary solution, should be refactored
+    QVector<float> bins16(16, 0.0f);
+
+    if (_bands32L.size() == 32 && _bands32R.size() == 32) {
+      // Pair adjacent 32-bins, average L/R then average the pair.
+      for (int i = 0; i < 16; ++i) {
+        const int k0 = 2*i;
+        const int k1 = k0 + 1;
+
+        float lPair = 0.5f * (_bands32L[k0] + _bands32L[k1]);
+        float rPair = 0.5f * (_bands32R[k0] + _bands32R[k1]);
+        float mono  = 0.5f * (lPair + rPair);   // simple LR average
+
+        bins16[i] = mono;  // raw linear magnitude for now
+      }
+
+      // Per-frame normalize to 0..1 so UDP sender can map to 0..255 cleanly.
+      float mx = 0.0f;
+      for (float v : bins16) if (v > mx) mx = v;
+      if (mx > 0.0f) {
+        const float inv = 1.0f / mx;
+        for (float &v : bins16) v = std::clamp(v * inv, 0.0f, 1.0f);
+      }
+    } else {
+      // If 32s aren't ready for some reason, emit zeros (valid shape).
+      // bins16 already zero-initialized.
+    }
+
+    emit binsReady(bins16);
+    // --- END TEMPORARY BLOCK ---
+
+    // Slide both FIFOs forward by hop in lock-step.
+    _fifoL.erase(_fifoL.begin(), _fifoL.begin() + _hop);
+    _fifoR.erase(_fifoR.begin(), _fifoR.begin() + _hop);
+  }
+}
 
 void AudioProcessor::processOneFrameStereo() {
   // 1) Copy first N from FIFOs
   std::memcpy(_frameL.data(), _fifoL.data(), _N * sizeof(float));
   std::memcpy(_frameR.data(), _fifoR.data(), _N * sizeof(float));
-
 
   // 2) Window (Hann precomputed)
   for (int i = 0; i < _N; ++i) {
@@ -187,9 +196,16 @@ void AudioProcessor::processOneFrameStereo() {
   kiss_fftr(_cfg, _frameL.data(), _specL.data());
   kiss_fftr(_cfg, _frameR.data(), _specR.data());
 
+  // 4) Compute frequency bands
+  computeFrequencyBands();
 
-  // 5) Sum simple magnitudes into 32 bands (no normalization yet)
-  //    (Skip DC by construction of kLo/kHi)
+  // 5) Emit results
+  emitResults();
+}
+
+void AudioProcessor::computeFrequencyBands() {
+  // Sum simple magnitudes into 32 bands (no normalization yet)
+  // (Skip DC by construction of kLo/kHi)
   for (int b = 0; b < 32; ++b) {
     float sumL = 0.0f;
     float sumR = 0.0f;
@@ -206,20 +222,35 @@ void AudioProcessor::processOneFrameStereo() {
 
     _bands32L[b] = sumL;
     _bands32R[b] = sumR;
-
-    QVector<float> qL = QVector<float>(static_cast<int>(_bands32L.size()));
-    QVector<float> qR = QVector<float>(static_cast<int>(_bands32R.size()));
-    std::memcpy(qL.data(), _bands32L.data(), _bands32L.size()*sizeof(float));
-    std::memcpy(qR.data(), _bands32R.data(), _bands32R.size()*sizeof(float));
-
-    emit bins32ReadyRaw(qL, qR);
   }
 }
 
+void AudioProcessor::emitResults() {
+  // Create QVectors efficiently using iterators
+  QVector<float> qL(_bands32L.begin(), _bands32L.end());
+  QVector<float> qR(_bands32R.begin(), _bands32R.end());
+  emit bins32ReadyRaw(qL, qR);
+
+  // Compute RMS levels once
+  float rmsL = computeRMS(_frameL);
+  float rmsR = computeRMS(_frameR);
+  
+  float dbL = 20.0f * std::log10(std::max(rmsL, 1e-6f));
+  float dbR = 20.0f * std::log10(std::max(rmsR, 1e-6f));
+  
+  emit levelsReady(dbL, dbR);
+}
+
+float AudioProcessor::computeRMS(const std::vector<float>& frame) {
+  float rms = 0.0f;
+  for (int n = 0; n < _N; ++n) {
+    rms += frame[n] * frame[n];
+  }
+  return std::sqrt(rms / float(_N));
+}
 
 
-
-
+// LEGACY CODE - COMMENTED OUT FOR REFERENCE
 // void AudioProcessor::processAvailable() {
 //   ensureInit();
 //   while (!_stop.load() && (int)_fifo.size() >= _N) {

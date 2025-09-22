@@ -15,64 +15,67 @@ public:
   ~AudioProcessor();
 
   // Use actual sample rate from capture (call once after capture reports it)
-  void setSampleRate(int sr) { _sr = sr; _cfg = nullptr; }  // forces re-init on next use
+  void setSampleRate(int sr) { 
+    if (sr != _sr) {
+      _sr = sr; 
+      _initialized = false;  // Force re-initialization
+    }
+  }
 
 public slots:
   void start();
   void requestStop(); 
-  void onFrames(const QVector<float>& left, const QVector<float>& right);   // <- L/R from AudioCapture::framesReady()
+  void onFrames(const QVector<float>& left, const QVector<float>& right);
 
 signals:
   // 16 bins, normalized 0..1 (per-frame), ready for UDP sender.
   void binsReady(const QVector<float>& bins16);
-  //new 32 bins, raw linear RMS, ready for BarsWidget
+  // 32 bins, raw linear magnitudes for BarsWidget
   void bins32ReadyRaw(const QVector<float>& left, const QVector<float>& right);
-  void levelsReady(float leftDb, float rightDb);  // peak levels in dBFS (smoothed)
+  void levelsReady(float leftDb, float rightDb);  // RMS levels in dBFS
   void stopped();
 
 private:
-  // FFT params (defaults; will re-init if _sr changes)
-  int _sr   = 48000;
-  int _N    = 1024;    // ~21.3 ms @ 48k
-  int _hop  = 256;     // ~5.3 ms update cadence
+  // FFT parameters
+  int _sr   = 48000;   // Sample rate
+  int _N    = 1024;    // FFT size (~21.3 ms @ 48k)
+  int _hop  = 256;     // Hop size (~5.3 ms update cadence)
 
-  // Smoothing time constant (seconds) -> compute EMA alpha from hop
-  float _tau = 0.10f;  // 100 ms default
-
-  // FFT state
-  kiss_fftr_cfg _cfg = nullptr;               // created by kiss_fftr_alloc()
-  std::vector<float> _window;                 // Hann window
-  std::vector<float> _frameL;
-  std::vector<float> _frameR;                  // length N, windowed mono frame
-  std::vector<kiss_fft_cpx> _specL;
-  std::vector<kiss_fft_cpx> _specR;            // N/2+1 complex spectrum
-  std::vector<float> _magL;
-  std::vector<float> _magR;                        // magnitude spectrum (N/2+1)
-
-  QVector<int>   _kLo32, _kHi32;     // 32-band bin ranges
-
-  // Binning
-  int _bins = 16;
-  std::vector<int> _kLo, _kHi;                // inclusive k-ranges for each bin
-
-  // FIFO of incoming mono samples from capture
-  std::vector<float> _fifoL;
-  std::vector<float> _fifoR;
-  //std::vector<float> _fifo;  // mono interleaved (for _N samples)
-
-  std::vector<float> _bands32L;   // size 32, left-channel magnitudes
-  std::vector<float> _bands32R;   // size 32, right-channel magnitudes
-
+  // State management
   std::atomic<bool> _stop{false};
+  bool _initialized = false;
 
-  // Helpers
-  void ensureInit();
-  void ensureLayout32();
-  void computeWindow();
-  void computeBinLayout();
-  float emaAlpha() const;                     // alpha from _tau and _hop/_sr
-  //void processAvailable();
-  void processAvailableStereo();
-  //void processOneFrame();
-  void processOneFrameStereo();                       // assumes _fifo.size() >= _N
+  // FFT resources
+  kiss_fftr_cfg _cfg = nullptr;
+  std::vector<float> _window;                 // Hann window (length N)
+  std::vector<float> _frameL;                 // Left channel frame (length N)
+  std::vector<float> _frameR;                 // Right channel frame (length N)
+  std::vector<kiss_fft_cpx> _specL;          // Left spectrum (N/2+1)
+  std::vector<kiss_fft_cpx> _specR;          // Right spectrum (N/2+1)
+  std::vector<float> _magL;                   // Left magnitudes (N/2+1) - unused but kept for compatibility
+  std::vector<float> _magR;                   // Right magnitudes (N/2+1) - unused but kept for compatibility
+
+  // Audio input buffers
+  std::vector<float> _fifoL;                  // Left channel FIFO
+  std::vector<float> _fifoR;                  // Right channel FIFO
+
+  // Frequency band analysis (32 bands)
+  QVector<int> _kLo32, _kHi32;               // Frequency bin ranges for 32 bands
+  std::vector<float> _bands32L;               // Left channel band magnitudes (32)
+  std::vector<float> _bands32R;               // Right channel band magnitudes (32)
+
+  // Core processing methods
+  void initialize();                          // Main initialization
+  void cleanup();                            // Resource cleanup
+  void processAvailableStereo();             // Process available stereo samples
+  void processOneFrameStereo();              // Process one frame of stereo audio
+  
+  // Setup methods
+  void computeWindow();                      // Compute Hann window
+  void setupFrequencyBands();                // Setup 32-band frequency layout
+  
+  // Analysis methods
+  void computeFrequencyBands();              // Compute band magnitudes from FFT
+  void emitResults();                        // Emit all signals
+  float computeRMS(const std::vector<float>& frame);  // Compute RMS of frame
 };
