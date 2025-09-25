@@ -27,13 +27,26 @@ Uses 3 QT classes: QPushButton, QLabel, QProgressBar
 
 Uses 3 of our classes: AudioCapture, AudioProcessor, BarsWidget, UDPSrSender
 
+Here we create QT objects like buttons and windows with layout
+
+Then we create our own classes objects and move them to QT threads
+
+We then connect all of the signals and slots between the our objects
+
+main.cpp starts the window but the application is made in MainWindow
+
+
 ### AudioCapture
+Set up miniaudio loopback device and emit audio frames
 
 ### AudioProcessor
+Receive audio frames and perform fft to send to bars widget and udpSRSender
 
 ### BarsWidget
+Turn frequency bin values into visual with QTPaint and more
 
 ### UDPSrSender
+Create a WLED SR packet with our outputs from processor
 
 
 ## Current State / Goals
@@ -43,14 +56,14 @@ The 32 bins are then smashed into 16 bins by averaging adjacent bins this is tem
 
 Ideally we can do calculations on instances of the 32 bins
 We are looking for percussive and harmonic sounds
-- Percussive can be seen by the bass drums hitting the first 6 bins
-- Harmonic is a sustained tone at a more specific frequency
+- Percussive can be seen by sudden jumps over multiple frequencies
+- Harmonic is a sustained tone at a more specific frequency sometimes changing slowly
 
 We could also look at the shape of the bars as a whole
 Or the frequency of certain bars spiking
 
 Finally we can create light effects dependent on whatever we can collect from the 32
-We can also create an edited 16 bins with the goal of best representing sounds on premade effects
+to create an edited 16 bins with the goal of best representing sounds on premade effects
 
 Can combine these two to create triggers where led packets not sound packets take over from the standard SR effects
 

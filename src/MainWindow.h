@@ -17,6 +17,10 @@ class BarsWidget;
 class AudioCapture;
 class AudioProcessor;
 
+// forward declare the advanced processor and visualizer
+class MultiResolutionVisualizerWidget;
+class AdvancedAudioProcessor;
+
 class UdpSrSender;
 
 class MainWindow : public QMainWindow {
@@ -35,14 +39,18 @@ private:
   QProgressBar* _meterL{};     // Left RMS meter
   QProgressBar* _meterR{};     // Right RMS meter
 
-  // ADD: the FFT bars widget
+  // ADD: the widgets
   BarsWidget*   _bars{};
+  MultiResolutionVisualizerWidget* _visualizer{};
 
   // ── Threads & workers ──
   QThread        _audioThread;
   QThread        _dspThread;
+  QThread        _adspThread;
   AudioCapture*  _audio{};
   AudioProcessor*_dsp{};
+  AdvancedAudioProcessor* _adsp{};
+  
   bool _running{false};
 
   UdpSrSender* _srSender{nullptr};

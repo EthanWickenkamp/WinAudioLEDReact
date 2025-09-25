@@ -29,6 +29,8 @@ add_executable(wledqt
   src/AudioCapture.h src/AudioCapture.cpp
   src/AudioProcessor.h src/AudioProcessor.cpp
   src/BarsWidget.h   src/BarsWidget.cpp
+  src/AdvancedAudioProcessor.h src/AdvancedAudioProcessor.cpp
+  src/MultiResolutionVisualizerWidget.h src/MultiResolutionVisualizerWidget.cpp
   src/miniaudio_impl.cpp
   src/UdpSrSender.h
 )
