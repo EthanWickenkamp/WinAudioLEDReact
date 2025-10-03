@@ -29,10 +29,13 @@ add_executable(wledqt
   src/AudioCapture.h src/AudioCapture.cpp
   src/AudioProcessor.h src/AudioProcessor.cpp
   src/BarsWidget.h   src/BarsWidget.cpp
-  src/AdvancedAudioProcessor.h src/AdvancedAudioProcessor.cpp
-  src/MultiResolutionVisualizerWidget.h src/MultiResolutionVisualizerWidget.cpp
+  #src/AdvancedAudioProcessor.h src/AdvancedAudioProcessor.cpp
+  #src/MultiResolutionVisualizerWidget.h src/MultiResolutionVisualizerWidget.cpp
   src/miniaudio_impl.cpp
   src/UdpSrSender.h
+  src/Snapshot.h
+  src/SnapshotManager.h src/SnapshotManager.cpp
+  src/SnapshotViewer.h src/SnapshotViewer.cpp
 )
 
 # Include paths for your sources and vendored headers

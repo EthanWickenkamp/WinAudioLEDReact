@@ -1,10 +1,10 @@
 This repository is a QT windows application to take audio loopback from the device and process it into fft bins
 The goal is to take processed audio and use it to stream led effects to wled modules
 
-## How it works
+# How it works
 
 
-### External Libraries
+## External Libraries
 
 #### miniaudio - AudioCapture
 just a header file
@@ -16,6 +16,7 @@ simple fft library
 input sample rate, sample size, overlap size
 give a spectrum and magnitude?
 
+## Main QT framework
 
 ### main.cpp
 This is what we make the executable out of
@@ -35,6 +36,26 @@ We then connect all of the signals and slots between the our objects
 
 main.cpp starts the window but the application is made in MainWindow
 
+## Frequency analysis
+
+FFT can be optimized for our goals with different parameters.
+
+48000 kHz sample rate from laptop and browser
+44100 kHz is more common
+
+Capture feed a period of 480 frames out of signal framesReady
+, this is every 10ms at 48000 kHz
+
+The Processor receives a fifo of the frames from slot onFrames
+
+Then we take _N samples in processor to perform fft on
+
+Then _hop the number of frames 25%, 50%, 75% of _N to move onto next but maintain temporal resolution
+
+A window is applied to each section of samples to converge frequencies to 0 at borders, removes false reads at edges
+
+
+
 
 ### AudioCapture
 Set up miniaudio loopback device and emit audio frames
@@ -42,14 +63,19 @@ Set up miniaudio loopback device and emit audio frames
 ### AudioProcessor
 Receive audio frames and perform fft to send to bars widget and udpSRSender
 
+
+
+
+
 ### BarsWidget
 Turn frequency bin values into visual with QTPaint and more
 
 ### UDPSrSender
 Create a WLED SR packet with our outputs from processor
+A 44 byte packet primarily 16 frequency bins
 
 
-## Current State / Goals
+# Current State / Goals
 
 Currently we can analyze loopback audio and turn it into 32 bins ranging from 20-18000 hz
 The 32 bins are then smashed into 16 bins by averaging adjacent bins this is temporary

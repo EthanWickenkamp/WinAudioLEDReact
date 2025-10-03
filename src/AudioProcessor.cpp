@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <QDebug>
 
 AudioProcessor::AudioProcessor(QObject* parent) : QObject(parent) {}
 
@@ -9,61 +10,26 @@ AudioProcessor::~AudioProcessor() {
   cleanup();
 }
 
-void AudioProcessor::start() {
-  _stop.store(false);
-  _initialized = false; // Force re-initialization
-  cleanup(); // Clean up any existing resources
-  _fifoL.clear();
-  _fifoR.clear();
-}
-
-void AudioProcessor::requestStop() {
-  _stop.store(true);
-  cleanup();
-  _fifoL.clear(); 
-  _fifoR.clear();
-}
-
 void AudioProcessor::cleanup() {
   if (_cfg) { 
     kiss_fftr_free(_cfg); 
     _cfg = nullptr; 
   }
+  _fifoL.clear(); 
+  _fifoR.clear();
 }
 
-// Receive LEFT/RIGHT samples from capture and append to their FIFOs.
-void AudioProcessor::onFrames(const QVector<float>& left,
-                              const QVector<float>& right)
-{
-  if (_stop.load()) return;
-  if (left.isEmpty() || right.isEmpty()) return;
+void AudioProcessor::requestStop() {
+  if (!_running.exchange(false)) return;
+  cleanup();
+  emit stopped();
+}
 
-  // Enforce alignment: use the smaller of the two to avoid drift.
-  int nL = left.size();
-  int nR = right.size();
-  int n  = (nL < nR) ? nL : nR;
-  if (n <= 0) return;
-
-  if (nL != nR) {
-    // Optional: warn about mismatch, but still process the smaller chunk.
-    qWarning("AudioProcessor::onFrames: left/right size mismatch %d != %d",
-             nL, nR);
-  }
-
-  // Append to L FIFO.
-  const int prevL = _fifoL.size();
-  _fifoL.reserve(prevL + n);          // no-op if already large enough
-  _fifoL.resize(prevL + n);
-  std::memcpy(_fifoL.data() + prevL, left.constData(), n * sizeof(float));
-
-  // Append to R FIFO.
-  const int prevR = _fifoR.size();
-  _fifoR.reserve(prevR + n);
-  _fifoR.resize(prevR + n);
-  std::memcpy(_fifoR.data() + prevR, right.constData(), n * sizeof(float));
-
-  // Drive stereo processing (will consume in lock-step by _hop).
-  processAvailableStereo();
+void AudioProcessor::start() {
+  // Prevent double-start.
+  if (_running.exchange(true)) return;
+  _initialized = false;
+  cleanup();
 }
 
 void AudioProcessor::initialize() {
@@ -87,9 +53,32 @@ void AudioProcessor::initialize() {
 
   // Setup all components
   computeWindow();
+  computeDCBlockerCoeff();  // <-- ADD THIS LINE
   setupFrequencyBands();
 
   _initialized = true;
+}
+
+static int nearestPow2Clamped(int x, int lo = 1024, int hi = 4096) {
+  int p = 1; while (p < x) p <<= 1;
+  return std::clamp(p, lo, hi);
+}
+
+void AudioProcessor::setSampleRate(int sr) {
+  if (sr <= 0) return;
+  // If SR is unchanged, nothing to do.
+  if (sr == _sr) return;
+  _sr = sr;
+  // Optional: keep a roughly constant time window (~43 ms)
+  const int targetSamples = int(std::lround(_sr * 0.043));  // ~43 ms
+  const int newN = nearestPow2Clamped(targetSamples, 1024, 4096);
+  if (newN != _N) {
+    _N   = newN;
+    _hop = _N / 2;                  // 50% overlap
+  }
+  // Force a fresh DSP init on next frames
+  _initialized = false;
+  cleanup();                        // free old FFT plan/buffers so initialize() rebuilds with new SR/_N
 }
 
 void AudioProcessor::computeWindow() {
@@ -99,40 +88,88 @@ void AudioProcessor::computeWindow() {
   }
 }
 
+void AudioProcessor::setNumBands(int n) {
+  // clamp to allowed values; expand later if you want.
+  if (n != 16 && n != 32 && n != 64) return;
+  if (n == _numBands) return;
+  _numBands = n;
+  _initialized = false;
+  cleanup();              // rebuild edges on next initialize()
+}
+
 void AudioProcessor::setupFrequencyBands() {
-  const int numBands = 32;
-  _kLo32.resize(numBands);
-  _kHi32.resize(numBands);
-  _bands32L.resize(numBands);
-  _bands32R.resize(numBands);
+  _kLo.resize(_numBands);
+  _kHi.resize(_numBands);
+  _bandsL.assign(_numBands, 0.0f);
+  _bandsR.assign(_numBands, 0.0f);
 
   const float fNyq = 0.5f * _sr;
   const float fMin = 20.0f;
   const float fMax = std::min(18000.0f, 0.98f * fNyq);
 
-  // Log-spaced edges (33 points for 32 bands)
-  float edges[33];
+  // Log-spaced edges: (_numBands + 1) points
+  std::vector<float> edges(_numBands + 1);
   const float ratio = fMax / fMin;
-  for (int i = 0; i <= 32; ++i) {
-    float t = float(i) / 32.0f;
+  for (int i = 0; i <= _numBands; ++i) {
+    float t = float(i) / float(_numBands);
     edges[i] = fMin * std::pow(ratio, t);
   }
 
   auto hzToK = [&](float f)->int {
     int k = int(std::floor(f * _N / _sr));
-    // skip DC (k=0); clamp to valid [1, N/2]
     int kMin = 1;
     int kMax = std::max(2, _N/2);
     return std::clamp(k, kMin, kMax);
   };
 
-  for (int i = 0; i < 32; ++i) {
+  for (int i = 0; i < _numBands; ++i) {
     int k0 = hzToK(edges[i]);
     int k1 = hzToK(edges[i+1]);
     if (k1 <= k0) k1 = std::min(k0 + 1, _N/2);
-    _kLo32[i] = k0;
-    _kHi32[i] = k1;
+    _kLo[i] = k0;
+    _kHi[i] = k1;
   }
+}
+
+// Receive LEFT/RIGHT samples from capture and append to their FIFOs.
+void AudioProcessor::onFrames(const QVector<float>& left, const QVector<float>& right)
+{
+  if (!_running.load()) return;
+  if (left.isEmpty() || right.isEmpty()) return;
+
+  // Enforce alignment: use the smaller of the two to avoid drift.
+  int nL = left.size();
+  int nR = right.size();
+  int n  = (nL < nR) ? nL : nR;
+  if (n <= 0) return;
+
+  if (nL != nR) {
+    // Optional: warn about mismatch, but still process the smaller chunk.
+    qWarning("AudioProcessor::onFrames: left/right size mismatch %d != %d", nL, nR);
+  }
+
+    // === LOG INCOMING AUDIO (Remove after debugging) ===
+  static int logCounter = 0;
+  if (logCounter++ % 50 == 0) {  // Log every 50th frame to avoid spam
+    logAudioStats(left, "LEFT_IN ");
+    logAudioStats(right, "RIGHT_IN");
+  }
+  // === END LOG ===
+
+  // Append to L FIFO.
+  const int prevL = _fifoL.size();
+  _fifoL.reserve(prevL + n);          // no-op if already large enough
+  _fifoL.resize(prevL + n);
+  std::memcpy(_fifoL.data() + prevL, left.constData(), n * sizeof(float));
+
+  // Append to R FIFO.
+  const int prevR = _fifoR.size();
+  _fifoR.reserve(prevR + n);
+  _fifoR.resize(prevR + n);
+  std::memcpy(_fifoR.data() + prevR, right.constData(), n * sizeof(float));
+
+  // Drive stereo processing (will consume in lock-step by _hop).
+  processAvailableStereo();
 }
 
 void AudioProcessor::processAvailableStereo() {
@@ -140,21 +177,21 @@ void AudioProcessor::processAvailableStereo() {
   if (!_initialized || !_cfg) return;  // if initialization failed, bail safely
 
   // Consume while both channels have at least N samples.
-  while (!_stop.load() && (int)_fifoL.size() >= _N && (int)_fifoR.size() >= _N){
+  while (_running.load() && (int)_fifoL.size() >= _N && (int)_fifoR.size() >= _N){
     processOneFrameStereo();  // copies N from each FIFO, windows, FFTs L/R, bands, etc.
 
     // --- TEMPORARY: 32 (L/R) -> 16 mono control bins (simple & fast) ---
     // TODO: This is a temporary solution, should be refactored
     QVector<float> bins16(16, 0.0f);
 
-    if (_bands32L.size() == 32 && _bands32R.size() == 32) {
+    if (_bandsL.size() == 32 && _bandsR.size() == 32) {
       // Pair adjacent 32-bins, average L/R then average the pair.
       for (int i = 0; i < 16; ++i) {
         const int k0 = 2*i;
         const int k1 = k0 + 1;
 
-        float lPair = 0.5f * (_bands32L[k0] + _bands32L[k1]);
-        float rPair = 0.5f * (_bands32R[k0] + _bands32R[k1]);
+        float lPair = 0.5f * (_bandsL[k0] + _bandsL[k1]);
+        float rPair = 0.5f * (_bandsR[k0] + _bandsR[k1]);
         float mono  = 0.5f * (lPair + rPair);   // simple LR average
 
         bins16[i] = mono;  // raw linear magnitude for now
@@ -186,6 +223,32 @@ void AudioProcessor::processOneFrameStereo() {
   std::memcpy(_frameL.data(), _fifoL.data(), _N * sizeof(float));
   std::memcpy(_frameR.data(), _fifoR.data(), _N * sizeof(float));
 
+    // === LOG BEFORE DC BLOCKER ===
+  static int frameCounter = 0;
+  bool shouldLog = (frameCounter++ % 50 == 0);
+  
+  if (shouldLog) {
+    QVector<float> beforeL(_frameL.begin(), _frameL.end());
+    logAudioStats(beforeL, "BEFORE_DC");
+  }
+  // === END LOG ===
+
+    // 1.5) Apply DC blocker BEFORE windowing
+  applyDCBlocker(_frameL, _dcBlockerXprevL, _dcBlockerYprevL);
+  applyDCBlocker(_frameR, _dcBlockerXprevR, _dcBlockerYprevR);
+
+    // === LOG AFTER DC BLOCKER ===
+  if (shouldLog) {
+    QVector<float> afterL(_frameL.begin(), _frameL.end());
+    logAudioStats(afterL, "AFTER_DC ");
+    
+    // Also log DC blocker state
+    qDebug() << "DC_STATE | xPrevL:" << _dcBlockerXprevL 
+             << "| yPrevL:" << _dcBlockerYprevL
+             << "| coeff:" << _dcBlockerCoeff;
+  }
+  // === END LOG ===
+
   // 2) Window (Hann precomputed)
   for (int i = 0; i < _N; ++i) {
     _frameL[i] *= _window[i];
@@ -204,40 +267,63 @@ void AudioProcessor::processOneFrameStereo() {
 }
 
 void AudioProcessor::computeFrequencyBands() {
-  // Sum simple magnitudes into 32 bands (no normalization yet)
-  // (Skip DC by construction of kLo/kHi)
-  for (int b = 0; b < 32; ++b) {
-    float sumL = 0.0f;
-    float sumR = 0.0f;
-    const int k0 = _kLo32[b];
-    const int k1 = _kHi32[b]; // exclusive
-
+  for (int b = 0; b < _numBands; ++b) {
+    float sumL = 0.0f, sumR = 0.0f;
+    const int k0 = _kLo[b];
+    const int k1 = _kHi[b]; // exclusive
     for (int k = k0; k < k1; ++k) {
       const kiss_fft_cpx &XL = _specL[k];
       const kiss_fft_cpx &XR = _specR[k];
-      // pure magnitude (linear). Simple & fast.
       sumL += std::hypot((float)XL.r, (float)XL.i);
       sumR += std::hypot((float)XR.r, (float)XR.i);
     }
-
-    _bands32L[b] = sumL;
-    _bands32R[b] = sumR;
+    _bandsL[b] = sumL;
+    _bandsR[b] = sumR;
   }
 }
 
-void AudioProcessor::emitResults() {
-  // Create QVectors efficiently using iterators
-  QVector<float> qL(_bands32L.begin(), _bands32L.end());
-  QVector<float> qR(_bands32R.begin(), _bands32R.end());
-  emit bins32ReadyRaw(qL, qR);
+static QVector<float> downmixToN(const std::vector<float>& src, int dstN) {
+  const int srcN = (int)src.size();
+  if (srcN <= 0 || dstN <= 0) return QVector<float>(dstN, 0.0f);
 
-  // Compute RMS levels once
+  QVector<float> out(dstN, 0.0f);
+
+  // Simple energy-preserving bucket average (contiguous groups).
+  // Map each dst bin to a [a,z) range in src indices.
+  for (int i = 0; i < dstN; ++i) {
+    const float aF = (float(i)    / dstN) * srcN;
+    const float zF = (float(i+1)  / dstN) * srcN;
+    const int   a  = std::max(0, (int)std::floor(aF));
+    const int   z  = std::min(srcN, (int)std::ceil (zF));
+    float acc = 0.0f;
+    int   cnt = 0;
+    for (int k = a; k < z; ++k) { acc += src[k]; ++cnt; }
+    out[i] = (cnt > 0) ? acc / float(cnt) : 0.0f;
+  }
+  return out;
+}
+
+void AudioProcessor::emitResults() {
+  // Emit raw current-size bands to the widget
+  QVector<float> qL(_bandsL.begin(), _bandsL.end());
+  QVector<float> qR(_bandsR.begin(), _bandsR.end());
+  emit binsReadyRaw(qL, qR);
+
+  // Always provide 16 for UDP sender (from whatever _numBands is)
+  QVector<float> bins16 = downmixToN(_bandsL, 16);
+  // normalize 0..1 like you did
+  float mx = 0.0f; for (float v : bins16) mx = std::max(mx, v);
+  if (mx > 0.0f) {
+    const float inv = 1.0f / mx;
+    for (float &v : bins16) v = std::clamp(v * inv, 0.0f, 1.0f);
+  }
+  emit binsReady(bins16);
+
+  // Levels (unchanged)
   float rmsL = computeRMS(_frameL);
   float rmsR = computeRMS(_frameR);
-  
   float dbL = 20.0f * std::log10(std::max(rmsL, 1e-6f));
   float dbR = 20.0f * std::log10(std::max(rmsR, 1e-6f));
-  
   emit levelsReady(dbL, dbR);
 }
 
@@ -248,6 +334,65 @@ float AudioProcessor::computeRMS(const std::vector<float>& frame) {
   }
   return std::sqrt(rms / float(_N));
 }
+
+void AudioProcessor::computeDCBlockerCoeff() {
+  // DC blocker is a 1st-order high-pass filter
+  // Transfer function: H(z) = (1 - z^-1) / (1 - R*z^-1)
+  // where R = 1 - (2*pi*fc/fs)
+  // For fc = 20Hz cutoff
+  
+  const float fc = 20.0f;  // Cutoff frequency in Hz
+  const float fs = static_cast<float>(_sr);
+  
+  // Calculate coefficient (closer to 1.0 = higher cutoff)
+  _dcBlockerCoeff = 1.0f - (2.0f * float(M_PI) * fc / fs);
+  
+  // Clamp to safe range
+  _dcBlockerCoeff = std::clamp(_dcBlockerCoeff, 0.9f, 0.999f);
+}
+
+// Apply DC blocker to a frame
+void AudioProcessor::applyDCBlocker(std::vector<float>& frame, float& xPrev, float& yPrev) {
+  // Process each sample in the frame
+  for (int i = 0; i < _N; ++i) {
+    const float x = frame[i];
+    const float y = x - xPrev + _dcBlockerCoeff * yPrev;
+    
+    xPrev = x;
+    yPrev = y;
+    frame[i] = y;
+  }
+}
+
+void AudioProcessor::logAudioStats(const QVector<float>& samples, const QString& label) {
+  if (samples.isEmpty()) return;
+  
+  float minVal = samples[0];
+  float maxVal = samples[0];
+  float sumAbs = 0.0f;
+  float sumSq = 0.0f;
+  int zeroCount = 0;
+  
+  for (float s : samples) {
+    minVal = std::min(minVal, s);
+    maxVal = std::max(maxVal, s);
+    sumAbs += std::abs(s);
+    sumSq += s * s;
+    if (s == 0.0f) zeroCount++;
+  }
+  
+  float mean = sumAbs / samples.size();
+  float rms = std::sqrt(sumSq / samples.size());
+  
+  qDebug() << label 
+           << "| samples:" << samples.size()
+           << "| min:" << minVal 
+           << "| max:" << maxVal
+           << "| mean(abs):" << mean
+           << "| rms:" << rms
+           << "| zeros:" << zeroCount;
+}
+
 
 
 // LEGACY CODE - COMMENTED OUT FOR REFERENCE
